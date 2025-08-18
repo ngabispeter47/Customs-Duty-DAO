@@ -22,6 +22,8 @@
 (define-constant err-proposal-active (err u106))
 (define-constant err-insufficient-stake (err u107))
 (define-constant err-unauthorized (err u108))
+(define-constant err-self-delegation (err u109))
+(define-constant err-delegation-cycle (err u110))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var treasury-balance uint u0)
@@ -70,6 +72,23 @@
   {
     total-contributed: uint,
     last-contribution-block: uint
+  }
+)
+
+(define-map delegations
+  { delegator: principal }
+  {
+    delegate: principal,
+    delegated-amount: uint,
+    delegation-block: uint
+  }
+)
+
+(define-map delegation-power
+  { delegate: principal }
+  {
+    total-delegated: uint,
+    delegator-count: uint
   }
 )
 
@@ -156,15 +175,101 @@
   )
 )
 
+(define-public (delegate-voting-power (delegate principal) (amount uint))
+  (let
+    (
+      (current-stake (unwrap! (map-get? member-stakes { member: tx-sender }) err-not-found))
+      (existing-delegation (map-get? delegations { delegator: tx-sender }))
+      (delegate-power (default-to { total-delegated: u0, delegator-count: u0 }
+                                  (map-get? delegation-power { delegate: delegate })))
+    )
+    (asserts! (not (is-eq tx-sender delegate)) err-self-delegation)
+    (asserts! (>= (get staked-amount current-stake) amount) err-insufficient-balance)
+    
+    (match existing-delegation
+      prev-delegation
+        (let
+          (
+            (prev-delegate (get delegate prev-delegation))
+            (prev-amount (get delegated-amount prev-delegation))
+            (prev-delegate-power (default-to { total-delegated: u0, delegator-count: u0 }
+                                            (map-get? delegation-power { delegate: prev-delegate })))
+          )
+          (map-set delegation-power
+            { delegate: prev-delegate }
+            {
+              total-delegated: (- (get total-delegated prev-delegate-power) prev-amount),
+              delegator-count: (- (get delegator-count prev-delegate-power) u1)
+            }
+          )
+        )
+      true
+    )
+    
+    (map-set delegations
+      { delegator: tx-sender }
+      {
+        delegate: delegate,
+        delegated-amount: amount,
+        delegation-block: stacks-block-height
+      }
+    )
+    
+    (map-set delegation-power
+      { delegate: delegate }
+      {
+        total-delegated: (+ (get total-delegated delegate-power) amount),
+        delegator-count: (+ (get delegator-count delegate-power) u1)
+      }
+    )
+    
+    (map-set member-stakes
+      { member: tx-sender }
+      (merge current-stake { voting-power: (- (get voting-power current-stake) amount) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (revoke-delegation)
+  (let
+    (
+      (delegation (unwrap! (map-get? delegations { delegator: tx-sender }) err-not-found))
+      (current-stake (unwrap! (map-get? member-stakes { member: tx-sender }) err-not-found))
+      (delegate (get delegate delegation))
+      (amount (get delegated-amount delegation))
+      (delegate-power (unwrap! (map-get? delegation-power { delegate: delegate }) err-not-found))
+    )
+    (map-delete delegations { delegator: tx-sender })
+    
+    (map-set delegation-power
+      { delegate: delegate }
+      {
+        total-delegated: (- (get total-delegated delegate-power) amount),
+        delegator-count: (- (get delegator-count delegate-power) u1)
+      }
+    )
+    
+    (map-set member-stakes
+      { member: tx-sender }
+      (merge current-stake { voting-power: (+ (get voting-power current-stake) amount) })
+    )
+    (ok true)
+  )
+)
+
 (define-public (vote-on-proposal (proposal-id uint) (vote bool) (amount uint))
   (let
     (
       (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) err-not-found))
       (member-stake (unwrap! (map-get? member-stakes { member: tx-sender }) err-not-found))
       (existing-vote (map-get? votes { proposal-id: proposal-id, voter: tx-sender }))
+      (delegate-power (default-to { total-delegated: u0, delegator-count: u0 }
+                                  (map-get? delegation-power { delegate: tx-sender })))
+      (total-voting-power (+ (get voting-power member-stake) (get total-delegated delegate-power)))
     )
     (asserts! (is-none existing-vote) err-already-voted)
-    (asserts! (>= (get staked-amount member-stake) amount) err-insufficient-balance)
+    (asserts! (>= total-voting-power amount) err-insufficient-balance)
     (asserts! (<= stacks-block-height (get end-block proposal)) err-proposal-ended)
     
     (map-set votes
@@ -301,6 +406,26 @@
 
 (define-read-only (get-token-uri)
   (ok none)
+)
+
+(define-read-only (get-delegation (delegator principal))
+  (map-get? delegations { delegator: delegator })
+)
+
+(define-read-only (get-delegation-power (delegate principal))
+  (map-get? delegation-power { delegate: delegate })
+)
+
+(define-read-only (get-effective-voting-power (member principal))
+  (let
+    (
+      (member-stake (default-to { staked-amount: u0, voting-power: u0, last-claim-block: u0 }
+                                 (map-get? member-stakes { member: member })))
+      (delegate-power (default-to { total-delegated: u0, delegator-count: u0 }
+                                  (map-get? delegation-power { delegate: member })))
+    )
+    (+ (get voting-power member-stake) (get total-delegated delegate-power))
+  )
 )
 
 (define-private (calculate-voting-power (staked-amount uint) (blocks-staked uint))
