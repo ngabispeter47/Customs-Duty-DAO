@@ -24,12 +24,16 @@
 (define-constant err-unauthorized (err u108))
 (define-constant err-self-delegation (err u109))
 (define-constant err-delegation-cycle (err u110))
+(define-constant err-reputation-penalty (err u111))
+(define-constant err-reputation-boost-limit (err u112))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var treasury-balance uint u0)
 (define-data-var min-proposal-stake uint u1000000)
 (define-data-var voting-period uint u1440)
 (define-data-var quorum-threshold uint u5000000)
+(define-data-var reputation-decay-rate uint u100)
+(define-data-var max-reputation-boost uint u5000)
 
 (define-map proposals
   { proposal-id: uint }
@@ -92,6 +96,18 @@
   }
 )
 
+(define-map member-reputation
+  { member: principal }
+  {
+    reputation-score: uint,
+    successful-proposals: uint,
+    failed-proposals: uint,
+    votes-cast: uint,
+    last-activity-block: uint,
+    reputation-level: uint
+  }
+)
+
 (define-public (initialize (initial-supply uint))
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -151,6 +167,8 @@
     (
       (proposal-id (+ (var-get proposal-counter) u1))
       (member-stake (unwrap! (map-get? member-stakes { member: tx-sender }) err-not-found))
+      (member-rep (default-to { reputation-score: u1000, successful-proposals: u0, failed-proposals: u0, votes-cast: u0, last-activity-block: u0, reputation-level: u1 }
+                              (map-get? member-reputation { member: tx-sender })))
     )
     (asserts! (>= (get staked-amount member-stake) (var-get min-proposal-stake)) err-insufficient-stake)
     (map-set proposals
@@ -266,17 +284,21 @@
       (existing-vote (map-get? votes { proposal-id: proposal-id, voter: tx-sender }))
       (delegate-power (default-to { total-delegated: u0, delegator-count: u0 }
                                   (map-get? delegation-power { delegate: tx-sender })))
-      (total-voting-power (+ (get voting-power member-stake) (get total-delegated delegate-power)))
+      (member-rep (default-to { reputation-score: u1000, successful-proposals: u0, failed-proposals: u0, votes-cast: u0, last-activity-block: u0, reputation-level: u1 }
+                              (map-get? member-reputation { member: tx-sender })))
+      (reputation-boost (calculate-reputation-boost (get reputation-score member-rep)))
+      (base-voting-power (+ (get voting-power member-stake) (get total-delegated delegate-power)))
+      (boosted-amount (if (< (+ amount reputation-boost) (* amount u2)) (+ amount reputation-boost) (* amount u2)))
     )
     (asserts! (is-none existing-vote) err-already-voted)
-    (asserts! (>= total-voting-power amount) err-insufficient-balance)
+    (asserts! (>= base-voting-power amount) err-insufficient-balance)
     (asserts! (<= stacks-block-height (get end-block proposal)) err-proposal-ended)
     
     (map-set votes
       { proposal-id: proposal-id, voter: tx-sender }
       {
         vote: vote,
-        amount: amount,
+        amount: boosted-amount,
         block-height: stacks-block-height
       }
     )
@@ -285,9 +307,9 @@
       { proposal-id: proposal-id }
       (merge proposal
         {
-          yes-votes: (if vote (+ (get yes-votes proposal) amount) (get yes-votes proposal)),
-          no-votes: (if vote (get no-votes proposal) (+ (get no-votes proposal) amount)),
-          total-stake: (+ (get total-stake proposal) amount)
+          yes-votes: (if vote (+ (get yes-votes proposal) boosted-amount) (get yes-votes proposal)),
+          no-votes: (if vote (get no-votes proposal) (+ (get no-votes proposal) boosted-amount)),
+          total-stake: (+ (get total-stake proposal) boosted-amount)
         }
       )
     )
@@ -307,7 +329,9 @@
     (let
       (
         (passed (> (get yes-votes proposal) (get no-votes proposal)))
+        (proposer (get proposer proposal))
       )
+      (let () true)
       (map-set proposals
         { proposal-id: proposal-id }
         (merge proposal { executed: true, passed: passed })
@@ -352,6 +376,51 @@
     (var-set min-proposal-stake new-min-stake)
     (var-set voting-period new-voting-period)
     (var-set quorum-threshold new-quorum)
+    (ok true)
+  )
+)
+
+(define-public (update-member-reputation (member principal) (successful-proposals uint) (failed-proposals uint) (votes-cast uint))
+  (let
+    (
+      (current-rep (default-to { reputation-score: u1000, successful-proposals: u0, failed-proposals: u0, votes-cast: u0, last-activity-block: u0, reputation-level: u1 }
+                               (map-get? member-reputation { member: member })))
+      (blocks-since-activity (- stacks-block-height (get last-activity-block current-rep)))
+      (decay-amount (if (> blocks-since-activity u1000) (/ (* (get reputation-score current-rep) (var-get reputation-decay-rate)) u10000) u0))
+      (base-score (- (get reputation-score current-rep) decay-amount))
+      (success-bonus (* successful-proposals u200))
+      (failure-penalty (* failed-proposals u100))
+      (vote-bonus (* votes-cast u10))
+      (new-score (+ (+ (- base-score failure-penalty) success-bonus) vote-bonus))
+      (clamped-score (if (< new-score u100) u100 (if (> new-score u10000) u10000 new-score)))
+      (new-level (calculate-reputation-level clamped-score))
+    )
+    (map-set member-reputation
+      { member: member }
+      {
+        reputation-score: clamped-score,
+        successful-proposals: (+ (get successful-proposals current-rep) successful-proposals),
+        failed-proposals: (+ (get failed-proposals current-rep) failed-proposals),
+        votes-cast: (+ (get votes-cast current-rep) votes-cast),
+        last-activity-block: stacks-block-height,
+        reputation-level: new-level
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (boost-member-reputation (member principal) (boost-amount uint))
+  (let
+    (
+      (current-rep (unwrap! (map-get? member-reputation { member: member }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= boost-amount (var-get max-reputation-boost)) err-reputation-boost-limit)
+    (map-set member-reputation
+      { member: member }
+      (merge current-rep { reputation-score: (if (< (+ (get reputation-score current-rep) boost-amount) u10000) (+ (get reputation-score current-rep) boost-amount) u10000) })
+    )
     (ok true)
   )
 )
@@ -428,9 +497,56 @@
   )
 )
 
+(define-read-only (get-member-reputation (member principal))
+  (map-get? member-reputation { member: member })
+)
+
+(define-read-only (get-reputation-boost-amount (member principal))
+  (let
+    (
+      (member-rep (default-to { reputation-score: u1000, successful-proposals: u0, failed-proposals: u0, votes-cast: u0, last-activity-block: u0, reputation-level: u1 }
+                              (map-get? member-reputation { member: member })))
+    )
+    (calculate-reputation-boost (get reputation-score member-rep))
+  )
+)
+
+(define-read-only (get-reputation-parameters)
+  {
+    reputation-decay-rate: (var-get reputation-decay-rate),
+    max-reputation-boost: (var-get max-reputation-boost)
+  }
+)
+
 (define-private (calculate-voting-power (staked-amount uint) (blocks-staked uint))
   (if (> blocks-staked u0)
     (+ staked-amount (/ (* staked-amount blocks-staked) u10000))
     staked-amount
+  )
+)
+
+(define-private (calculate-reputation-level (reputation-score uint))
+  (if (<= reputation-score u2000)
+    u1
+    (if (<= reputation-score u4000)
+      u2
+      (if (<= reputation-score u6000)
+        u3
+        (if (<= reputation-score u8000)
+          u4
+          u5
+        )
+      )
+    )
+  )
+)
+
+(define-private (calculate-reputation-boost (reputation-score uint))
+  (let
+    (
+      (base-boost (/ (* reputation-score u50) u10000))
+      (max-boost (var-get max-reputation-boost))
+    )
+    (if (< base-boost max-boost) base-boost max-boost)
   )
 )
