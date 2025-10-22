@@ -26,6 +26,9 @@
 (define-constant err-delegation-cycle (err u110))
 (define-constant err-reputation-penalty (err u111))
 (define-constant err-reputation-boost-limit (err u112))
+(define-constant err-reward-already-claimed (err u113))
+(define-constant err-reward-not-available (err u114))
+(define-constant err-insufficient-reward-pool (err u115))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var treasury-balance uint u0)
@@ -34,6 +37,9 @@
 (define-data-var quorum-threshold uint u5000000)
 (define-data-var reputation-decay-rate uint u100)
 (define-data-var max-reputation-boost uint u5000)
+(define-data-var reward-pool-balance uint u0)
+(define-data-var proposal-reward-rate uint u10000)
+(define-data-var voter-reward-rate uint u1000)
 
 (define-map proposals
   { proposal-id: uint }
@@ -105,6 +111,26 @@
     votes-cast: uint,
     last-activity-block: uint,
     reputation-level: uint
+  }
+)
+
+(define-map proposal-rewards
+  { proposal-id: uint }
+  {
+    total-reward-pool: uint,
+    proposer-reward: uint,
+    voter-reward-pool: uint,
+    rewards-claimed: bool,
+    eligible-voters: uint
+  }
+)
+
+(define-map member-rewards
+  { member: principal, proposal-id: uint }
+  {
+    reward-amount: uint,
+    claimed: bool,
+    participation-type: (string-ascii 32)
   }
 )
 
@@ -518,6 +544,25 @@
   }
 )
 
+(define-read-only (get-reward-pool-balance)
+  (var-get reward-pool-balance)
+)
+
+(define-read-only (get-proposal-reward-data (proposal-id uint))
+  (map-get? proposal-rewards { proposal-id: proposal-id })
+)
+
+(define-read-only (get-member-reward (member principal) (proposal-id uint))
+  (map-get? member-rewards { member: member, proposal-id: proposal-id })
+)
+
+(define-read-only (get-reward-rates)
+  {
+    proposal-reward-rate: (var-get proposal-reward-rate),
+    voter-reward-rate: (var-get voter-reward-rate)
+  }
+)
+
 (define-private (calculate-voting-power (staked-amount uint) (blocks-staked uint))
   (if (> blocks-staked u0)
     (+ staked-amount (/ (* staked-amount blocks-staked) u10000))
@@ -548,5 +593,142 @@
       (max-boost (var-get max-reputation-boost))
     )
     (if (< base-boost max-boost) base-boost max-boost)
+  )
+)
+
+(define-public (fund-reward-pool (amount uint))
+  (begin
+    (try! (ft-transfer? customs-token amount tx-sender (as-contract tx-sender)))
+    (var-set reward-pool-balance (+ (var-get reward-pool-balance) amount))
+    (ok true)
+  )
+)
+
+(define-public (distribute-proposal-rewards (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) err-not-found))
+      (existing-reward (map-get? proposal-rewards { proposal-id: proposal-id }))
+      (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
+      (proposal-passed (get passed proposal))
+      (proposer (get proposer proposal))
+    )
+    (asserts! (get executed proposal) err-invalid-proposal)
+    (asserts! (is-none existing-reward) err-reward-already-claimed)
+    (asserts! (> total-votes u0) err-invalid-proposal)
+    
+    (let
+      (
+        (base-reward (if proposal-passed (var-get proposal-reward-rate) (/ (var-get proposal-reward-rate) u2)))
+        (voter-pool (/ (* total-votes (var-get voter-reward-rate)) u100))
+        (total-reward-needed (+ base-reward voter-pool))
+      )
+      (asserts! (<= total-reward-needed (var-get reward-pool-balance)) err-insufficient-reward-pool)
+      
+      (map-set proposal-rewards
+        { proposal-id: proposal-id }
+        {
+          total-reward-pool: total-reward-needed,
+          proposer-reward: base-reward,
+          voter-reward-pool: voter-pool,
+          rewards-claimed: false,
+          eligible-voters: (count-proposal-voters proposal-id)
+        }
+      )
+      
+      (map-set member-rewards
+        { member: proposer, proposal-id: proposal-id }
+        {
+          reward-amount: base-reward,
+          claimed: false,
+          participation-type: "proposer"
+        }
+      )
+      
+      (var-set reward-pool-balance (- (var-get reward-pool-balance) total-reward-needed))
+      (ok true)
+    )
+  )
+)
+
+(define-public (claim-proposal-reward (proposal-id uint))
+  (let
+    (
+      (member-reward (unwrap! (map-get? member-rewards { member: tx-sender, proposal-id: proposal-id }) err-not-found))
+      (proposal-reward-data (unwrap! (map-get? proposal-rewards { proposal-id: proposal-id }) err-not-found))
+    )
+    (asserts! (not (get claimed member-reward)) err-reward-already-claimed)
+    
+    (let
+      (
+        (reward-amount (get reward-amount member-reward))
+      )
+      (try! (as-contract (ft-transfer? customs-token reward-amount tx-sender tx-sender)))
+      
+      (map-set member-rewards
+        { member: tx-sender, proposal-id: proposal-id }
+        (merge member-reward { claimed: true })
+      )
+      (ok reward-amount)
+    )
+  )
+)
+
+(define-public (calculate-voter-reward (proposal-id uint) (voter principal))
+  (let
+    (
+      (vote-data (unwrap! (map-get? votes { proposal-id: proposal-id, voter: voter }) err-not-found))
+      (proposal-reward-data (unwrap! (map-get? proposal-rewards { proposal-id: proposal-id }) err-not-found))
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) err-not-found))
+    )
+    (let
+      (
+        (vote-amount (get amount vote-data))
+        (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
+        (voter-pool (get voter-reward-pool proposal-reward-data))
+        (voter-share (if (> total-votes u0) (/ (* vote-amount voter-pool) total-votes) u0))
+      )
+      (map-set member-rewards
+        { member: voter, proposal-id: proposal-id }
+        {
+          reward-amount: voter-share,
+          claimed: false,
+          participation-type: "voter"
+        }
+      )
+      (ok voter-share)
+    )
+  )
+)
+
+(define-public (batch-calculate-voter-rewards (proposal-id uint) (voters (list 50 principal)))
+  (begin
+    (fold batch-process-voter voters proposal-id)
+    (ok true)
+  )
+)
+
+(define-private (batch-process-voter (voter principal) (proposal-id-acc uint))
+  (begin
+    (unwrap-panic (calculate-voter-reward proposal-id-acc voter))
+    proposal-id-acc
+  )
+)
+
+(define-public (update-reward-rates (new-proposal-rate uint) (new-voter-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set proposal-reward-rate new-proposal-rate)
+    (var-set voter-reward-rate new-voter-rate)
+    (ok true)
+  )
+)
+
+(define-private (count-proposal-voters (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap-panic (map-get? proposals { proposal-id: proposal-id })))
+    )
+    (+ (get yes-votes proposal) (get no-votes proposal))
   )
 )
