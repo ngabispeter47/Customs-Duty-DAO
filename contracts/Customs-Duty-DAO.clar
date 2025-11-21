@@ -29,6 +29,10 @@
 (define-constant err-reward-already-claimed (err u113))
 (define-constant err-reward-not-available (err u114))
 (define-constant err-insufficient-reward-pool (err u115))
+(define-constant err-amendment-window-closed (err u116))
+(define-constant err-amendment-limit-reached (err u117))
+(define-constant err-not-proposer (err u118))
+(define-constant err-amendment-not-found (err u119))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var treasury-balance uint u0)
@@ -40,6 +44,8 @@
 (define-data-var reward-pool-balance uint u0)
 (define-data-var proposal-reward-rate uint u10000)
 (define-data-var voter-reward-rate uint u1000)
+(define-data-var amendment-window uint u720)
+(define-data-var max-amendments-per-proposal uint u3)
 
 (define-map proposals
   { proposal-id: uint }
@@ -131,6 +137,24 @@
     reward-amount: uint,
     claimed: bool,
     participation-type: (string-ascii 32)
+  }
+)
+
+(define-map proposal-amendments
+  { proposal-id: uint }
+  {
+    amendment-count: uint,
+    last-amendment-block: uint
+  }
+)
+
+(define-map amendment-details
+  { proposal-id: uint, amendment-id: uint }
+  {
+    new-duty-rate: uint,
+    reason: (string-ascii 256),
+    amendment-block: uint,
+    vote-reset-count: uint
   }
 )
 
@@ -730,5 +754,87 @@
       (proposal (unwrap-panic (map-get? proposals { proposal-id: proposal-id })))
     )
     (+ (get yes-votes proposal) (get no-votes proposal))
+  )
+)
+
+(define-public (amend-proposal (proposal-id uint) (new-duty-rate uint) (reason (string-ascii 256)))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) err-not-found))
+      (amendments (default-to { amendment-count: u0, last-amendment-block: u0 }
+                              (map-get? proposal-amendments { proposal-id: proposal-id })))
+      (amendment-id (+ (get amendment-count amendments) u1))
+      (blocks-since-start (- stacks-block-height (get start-block proposal)))
+    )
+    (asserts! (is-eq tx-sender (get proposer proposal)) err-not-proposer)
+    (asserts! (<= stacks-block-height (get end-block proposal)) err-proposal-ended)
+    (asserts! (<= blocks-since-start (var-get amendment-window)) err-amendment-window-closed)
+    (asserts! (< (get amendment-count amendments) (var-get max-amendments-per-proposal)) err-amendment-limit-reached)
+    
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal { target-duty-rate: new-duty-rate })
+    )
+    
+    (map-set proposal-amendments
+      { proposal-id: proposal-id }
+      {
+        amendment-count: amendment-id,
+        last-amendment-block: stacks-block-height
+      }
+    )
+    
+    (map-set amendment-details
+      { proposal-id: proposal-id, amendment-id: amendment-id }
+      {
+        new-duty-rate: new-duty-rate,
+        reason: reason,
+        amendment-block: stacks-block-height,
+        vote-reset-count: u0
+      }
+    )
+    
+    (ok amendment-id)
+  )
+)
+
+(define-public (update-amendment-parameters (new-window uint) (new-max-amendments uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set amendment-window new-window)
+    (var-set max-amendments-per-proposal new-max-amendments)
+    (ok true)
+  )
+)
+
+(define-read-only (get-proposal-amendments (proposal-id uint))
+  (map-get? proposal-amendments { proposal-id: proposal-id })
+)
+
+(define-read-only (get-amendment-details (proposal-id uint) (amendment-id uint))
+  (map-get? amendment-details { proposal-id: proposal-id, amendment-id: amendment-id })
+)
+
+(define-read-only (get-amendment-parameters)
+  {
+    amendment-window: (var-get amendment-window),
+    max-amendments-per-proposal: (var-get max-amendments-per-proposal)
+  }
+)
+
+(define-read-only (can-amend-proposal (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) (err false)))
+      (amendments (default-to { amendment-count: u0, last-amendment-block: u0 }
+                              (map-get? proposal-amendments { proposal-id: proposal-id })))
+      (blocks-since-start (- stacks-block-height (get start-block proposal)))
+    )
+    (ok (and 
+      (is-eq tx-sender (get proposer proposal))
+      (<= stacks-block-height (get end-block proposal))
+      (<= blocks-since-start (var-get amendment-window))
+      (< (get amendment-count amendments) (var-get max-amendments-per-proposal))
+    ))
   )
 )
